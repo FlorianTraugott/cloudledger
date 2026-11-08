@@ -1,0 +1,9 @@
+.aws-sam/
+local/.data/
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+venv/
+node_modules/
+handoff/

@@ -1,0 +1,251 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  CloudLedger - a serverless expense tracker on AWS.
+  Amazon CloudFront + S3 (website), API Gateway HTTP API, AWS Lambda (Python),
+  Amazon DynamoDB, Amazon S3 (receipts), Amazon CloudWatch (logs, alarm, dashboard), IAM.
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Architectures: [arm64]
+    MemorySize: 256
+    Timeout: 10
+    Tracing: Active
+
+Parameters:
+  EnableCloudFront:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: >
+      "true" = private S3 bucket behind CloudFront (HTTPS, CDN).
+      "false" = S3 static website hosting (use while a new AWS account waits for CloudFront verification).
+
+Conditions:
+  UseCloudFront: !Equals [!Ref EnableCloudFront, "true"]
+  UseS3Website: !Not [Condition: UseCloudFront]
+
+Resources:
+  # ------------------------------------------------------------------ #
+  #  Data layer
+  # ------------------------------------------------------------------ #
+  ExpensesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: userId, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: userId, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  ReceiptsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [GET, PUT]
+            AllowedOrigins: ["*"]
+            AllowedHeaders: ["*"]
+            MaxAge: 3000
+
+  # ------------------------------------------------------------------ #
+  #  API layer
+  # ------------------------------------------------------------------ #
+  ExpenseApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowHeaders: [content-type, x-user-id]
+        AllowMethods: [GET, POST, PUT, DELETE, OPTIONS]
+        MaxAge: 600
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 50
+        ThrottlingRateLimit: 20
+
+  ExpenseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/src/
+      Handler: app.lambda_handler
+      Description: CloudLedger REST API
+      Environment:
+        Variables:
+          STORAGE: dynamodb
+          TABLE_NAME: !Ref ExpensesTable
+          BUCKET_NAME: !Ref ReceiptsBucket
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref ExpensesTable }
+        - S3CrudPolicy: { BucketName: !Ref ReceiptsBucket }
+      Events:
+        Health:        { Type: HttpApi, Properties: { ApiId: !Ref ExpenseApi, Path: /health, Method: GET } }
+        ListExpenses:  { Type: HttpApi, Properties: { ApiId: !Ref ExpenseApi, Path: /expenses, Method: GET } }
+        CreateExpense: { Type: HttpApi, Properties: { ApiId: !Ref ExpenseApi, Path: /expenses, Method: POST } }
+        DeleteExpense: { Type: HttpApi, Properties: { ApiId: !Ref ExpenseApi, Path: "/expenses/{id}", Method: DELETE } }
+        Summary:       { Type: HttpApi, Properties: { ApiId: !Ref ExpenseApi, Path: /summary, Method: GET } }
+        SetBudget:     { Type: HttpApi, Properties: { ApiId: !Ref ExpenseApi, Path: /budget, Method: PUT } }
+        UploadUrl:     { Type: HttpApi, Properties: { ApiId: !Ref ExpenseApi, Path: /receipts/upload-url, Method: POST } }
+
+  ExpenseFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ExpenseFunction}
+      RetentionInDays: 14
+
+  # ------------------------------------------------------------------ #
+  #  Website hosting: private S3 bucket served through CloudFront (HTTPS),
+  #  or S3 static website hosting when EnableCloudFront = "false"
+  # ------------------------------------------------------------------ #
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: !If [UseCloudFront, true, false]
+        RestrictPublicBuckets: !If [UseCloudFront, true, false]
+      WebsiteConfiguration: !If
+        - UseS3Website
+        - IndexDocument: index.html
+        - !Ref AWS::NoValue
+
+  FrontendPublicReadPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: UseS3Website
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Sid: PublicReadForStaticWebsite
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub ${FrontendBucket.Arn}/*
+
+  FrontendOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Condition: UseCloudFront
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: UseCloudFront
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: CloudLedger website
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        PriceClass: PriceClass_200
+        Origins:
+          - Id: website
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt FrontendOAC.Id
+            S3OriginConfig: { OriginAccessIdentity: "" }
+        DefaultCacheBehavior:
+          TargetOriginId: website
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6   # AWS managed "CachingOptimized"
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: UseCloudFront
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub ${FrontendBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}
+
+  # ------------------------------------------------------------------ #
+  #  Monitoring
+  # ------------------------------------------------------------------ #
+  ApiErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-lambda-errors
+      AlarmDescription: CloudLedger Lambda returned errors in the last 5 minutes
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref ExpenseFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub ${AWS::StackName}-dashboard
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{
+              "title":"Lambda invocations & errors","region":"${AWS::Region}","stat":"Sum","period":60,
+              "metrics":[["AWS/Lambda","Invocations","FunctionName","${ExpenseFunction}"],
+                         [".","Errors",".","."]]}},
+            {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{
+              "title":"Lambda duration (ms)","region":"${AWS::Region}","stat":"Average","period":60,
+              "metrics":[["AWS/Lambda","Duration","FunctionName","${ExpenseFunction}"]]}},
+            {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{
+              "title":"API Gateway requests & errors","region":"${AWS::Region}","stat":"Sum","period":60,
+              "metrics":[["AWS/ApiGateway","Count","ApiId","${ExpenseApi}"],
+                         [".","4xx",".","."],[".","5xx",".","."]]}},
+            {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{
+              "title":"DynamoDB consumed capacity","region":"${AWS::Region}","stat":"Sum","period":60,
+              "metrics":[["AWS/DynamoDB","ConsumedReadCapacityUnits","TableName","${ExpensesTable}"],
+                         [".","ConsumedWriteCapacityUnits",".","."]]}}
+          ]
+        }
+
+Outputs:
+  WebsiteUrl:
+    Description: Open this in a browser
+    Value: !If
+      - UseCloudFront
+      - !Sub https://${FrontendDistribution.DomainName}
+      - !GetAtt FrontendBucket.WebsiteURL
+  ApiUrl:
+    Description: Base URL of the REST API
+    Value: !Sub https://${ExpenseApi}.execute-api.${AWS::Region}.amazonaws.com
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+  ReceiptsBucketName:
+    Value: !Ref ReceiptsBucket
+  DistributionId:
+    Condition: UseCloudFront
+    Value: !Ref FrontendDistribution
+  TableName:
+    Value: !Ref ExpensesTable
+  DashboardUrl:
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-dashboard
